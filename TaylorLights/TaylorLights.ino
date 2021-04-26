@@ -1,10 +1,11 @@
-/*
-  Blink
-  Turns on an LED on for one second, then off for one second, repeatedly.
-
-  This example code is in the public domain.
+/**
+ * 
+ * 
+ * 
+ * 
+ * 
+ * 
  */
-
 
 #include <Wire.h>
 #include <ESP8266WiFi.h>
@@ -12,11 +13,15 @@
 #include <WiFiUdp.h>
 #include <Time.h>
 
+#include <Timezone_Generic.h>    // https://github.com/khoih-prog/Timezone_Generic
+TimeChangeRule usPDT = {"PDT", Second, Sun, Mar, 2, -420};
+TimeChangeRule usPST = {"PST", First, Sun, Nov, 2, -480};
+Timezone usPT(usPDT, usPST);
 
 #include "eepromMenu.h"
 ESP8266_EEPROM_Configs g_configs;   // From eepromMenu.h
-WiFiClient espClient;
 
+WiFiClient espClient;
 
 
 int led = LED_BUILTIN;
@@ -38,11 +43,17 @@ unsigned long lastButtonPress = millis();
 #define AMBER_TIMEOUT 5000
 
 char daysOfTheWeek[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
-const long utcOffsetInSeconds = -28800;
+const long utcOffsetInSeconds = 0;    // TZ calculated with Timezone_Generic library
 
 // Define NTP Client to get time
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
+
+// Light reset materials
+int lastButtonState = HIGH;
+#define RESET_PRESS_MIN_COUNT 5
+unsigned long pressTimes[RESET_PRESS_MIN_COUNT];
+#define RESET_PRESS_TIMEOUT 5000
 
 
 bool g_light_on = false;
@@ -50,13 +61,31 @@ bool g_light_on = false;
 // ** Flip the LED state ******************************************
 void toggle_light() {
   if( g_light_on ) {
-    digitalWrite(BUILTIN_LED, HIGH);
+    digitalWrite(LED_BUILTIN, HIGH);
     g_light_on = false;
   } else {
-    digitalWrite(BUILTIN_LED, LOW);
+    digitalWrite(LED_BUILTIN, LOW);
     g_light_on = true;
   }
 }
+
+
+// given a Timezone object, UTC and a string description, convert and print local time with time zone
+void printDateTime(Timezone tz, time_t utc, const char *descr)
+{
+    char buf[40];
+    char m[4];    // temporary storage for month string (DateStrings.cpp uses shared buffer)
+    TimeChangeRule *tcr;        // pointer to the time change rule, use to get the TZ abbrev
+
+    time_t t = tz.toLocal(utc, &tcr);
+    strcpy(m, monthShortStr(month(t)));
+    sprintf(buf, "%.2d:%.2d:%.2d %s %.2d %s %d %s",
+        hour(t), minute(t), second(t), dayShortStr(weekday(t)), day(t), m, year(t), tcr -> abbrev);
+    Serial.print(buf);
+    Serial.print(' ');
+    Serial.println(descr);
+}
+
 
 // ** Setup, initialize, and connect to the wifi network ********************************
 void wifi_connect(char* ssid, char* password) {
@@ -78,9 +107,7 @@ void wifi_connect(char* ssid, char* password) {
 }
 
 
-
-
-// the setup routine runs once when you press reset:
+// ** Once run setup routine ***************************************************************
 void setup() {
   Serial.begin(115200);             // Init serial
   delay(500);                       // Serial settle time
@@ -98,6 +125,12 @@ void setup() {
   pinMode(ARCADE_LED_PIN, OUTPUT);
   pinMode(ARCADE_BTN_PIN, INPUT_PULLUP);
 
+  // Initialize the press counts array to zeros
+  for(int i = 0; i < RESET_PRESS_MIN_COUNT; i++) {
+    pressTimes[i] = 0;
+  }
+  lastButtonState = HIGH;
+
   currSleepState = AWAKE;
   lastButtonPress = millis();
 
@@ -108,9 +141,25 @@ void setup() {
   digitalWrite(ARCADE_LED_PIN, LOW);
 }
 
-// the loop routine runs over and over again forever:
+
+// ** See if it's time to change back to a green light ***************************************
+void checkForWakeUp(Timezone tz, time_t utc) {
+  TimeChangeRule *tcr;
+  time_t t = tz.toLocal(utc, &tcr);
+  int currHour =  hour(t);
+  int currMinute = minute(t);
+
+  if(currHour == 6 && currMinute == 30) {
+    Serial.println("Time to wake, Taylor!");
+    currSleepState = AWAKE;
+  }
+}
+
+
+// ** Repeated main loop *********************************************************************
 void loop() {
   timeClient.update();
+  unsigned long currUTCEpoch = timeClient.getEpochTime();
   
   digitalWrite(RED_LED_PIN, HIGH);   // turn the LED on (HIGH is the voltage level)
   digitalWrite(AMBER_LED_PIN, HIGH);   // turn the LED on (HIGH is the voltage level)
@@ -134,39 +183,52 @@ void loop() {
       digitalWrite(RED_LED_PIN, HIGH);
       digitalWrite(AMBER_LED_PIN, LOW);
       digitalWrite(GREEN_LED_PIN, LOW);
+      checkForWakeUp(usPT, currUTCEpoch);
       break;
   }
 
+  // Detect a press to enter "going to sleep" state
   if(digitalRead(ARCADE_BTN_PIN) == LOW && currSleepState == AWAKE) {
     lastButtonPress = millis();
     currSleepState = GOING_DOWN;
   }
 
+  // Light up the arcade button pin if the button is pressed
   if(digitalRead(ARCADE_BTN_PIN) == LOW) {
     digitalWrite(ARCADE_LED_PIN, HIGH);
   } else {
     digitalWrite(ARCADE_LED_PIN, LOW);
   }
 
-  Serial.print(daysOfTheWeek[timeClient.getDay()]);
-  Serial.print(", ");
-  Serial.print(timeClient.getHours());
-  Serial.print(":");
-  Serial.print(timeClient.getMinutes());
-  Serial.print(":");
-  Serial.println(timeClient.getSeconds());
-  //Serial.println(timeClient.getFormattedTime());
+  // Counting a series of button presses for a reset
+  if(lastButtonState == HIGH && digitalRead(ARCADE_BTN_PIN) == LOW) {
+    for(int i = 0; i < RESET_PRESS_MIN_COUNT - 1; i++) {
+      pressTimes[i] = pressTimes[i + 1];
+    }
+    pressTimes[RESET_PRESS_MIN_COUNT-1] = millis();
+    lastButtonState = LOW;
 
-  unsigned long currEpoch = timeClient.getEpochTime();
-  Serial.println("Curr Epoch: " + String(currEpoch));
+    Serial.println("Button pressed");
 
-  time_t utcCalc = currEpoch;
-  Serial.println( day(utcCalc )) ;
-Serial.println( hour(utcCalc )) ;
-Serial.println( minute(utcCalc ) );
-  Serial.println( day(utcCalc )) ;
-Serial.println( month(utcCalc )) ;
-Serial.println( year(utcCalc ) );
+    if(pressTimes[0] + RESET_PRESS_TIMEOUT > millis()) {
+      Serial.println("Going awake");
+      currSleepState = AWAKE;
+
+      // Zero out button press array to force 5 more presses if done quickly
+      for(int i = 0; i < RESET_PRESS_MIN_COUNT; i++) {
+        pressTimes[i] = 0;
+      }
+
+      // Wait for a button release as to not dive right back into GOING_DOWN
+      while(digitalRead(ARCADE_BTN_PIN) == LOW) {
+        delay(50);
+      }
+      delay(250);
+    }
+    
+  } else if( lastButtonState == LOW && digitalRead(ARCADE_BTN_PIN) == HIGH ) {
+    lastButtonState = HIGH;
+  }
 
   delay(100);
   
